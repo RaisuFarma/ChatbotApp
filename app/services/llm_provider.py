@@ -1,8 +1,9 @@
 import os
 import logging
+import asyncio
 from dotenv import load_dotenv
 
-from openai import OpenAI
+from openai import AsyncOpenAI
 from typing import Optional
 
 load_dotenv()
@@ -29,50 +30,64 @@ class LLMClient:
             config: ProviderConfig,       
     ):
         self.config = config
-        self.client: Optional[OpenAI] = None
+        self.client: Optional[AsyncOpenAI] = None
+        self.model_list = []
         self.init_client()
 
     def init_client(self):
         try:
-            self.client = OpenAI(
+            self.client = AsyncOpenAI(
                 api_key=self.config.api_key,
                 base_url=self.config.base_url,
             )
         except Exception as e:
             logger.error(f"Error initializing OpenAI client: {e}")
+            self.client = None
 
-    def get_model_list(self):
+    async def get_model_list(self):
+        if not self.client:
+            logger.error("Client not initialized")
+            return []
+        
         try:
-            model_list = self.client.models.list()
+            model_list = await self.client.models.list()
             models = list(model_list.data)
             for id, model in enumerate(models):
                 print(f"{id} - {model.id}")
+            self.model_list = models
             return models
         except Exception as e:
             logger.error(f"Error getting model list: {e}")
             return []
         
-    def chat_completions(
+    async def chat_completions(
             self,
-            chosen_model,
+            model_name: str,
             input_list,
             stream: bool = True
     ):
-        # TODO: monitor if other providers add OpenAI Responses API to their OpenAI-compatibility
-        # TODO: add other chat parameters
+        if not self.client:
+            logger.error("Client not initialized")
+            return
+        
         try: 
-            response = self.client.chat.completions.create(
-                model=chosen_model,
+            response = await self.client.chat.completions.create(
+                model=model_name,
                 messages=input_list,
                 stream=stream,
             )
-            return response
+
+            if stream:
+                async for chunk in response:
+                    if chunk.choices[0].delta.content:
+                        yield chunk.choices[0].delta.content
+            else:
+                yield response.choices[0].message.content
         except Exception as e:
             logger.error(f"Error in chat completions: {e}")
-            return None
         
 
-if __name__ == "__main__":
+async def test():
     config = ProviderConfig(
         description="Test",
         api_key=os.getenv("API_KEY"),
@@ -80,32 +95,34 @@ if __name__ == "__main__":
     )
 
     llm_client = LLMClient(config)
-    # present the user with a list of models, to choose for the chat step
-    model_list = llm_client.get_model_list()
+
+    model_list = await llm_client.get_model_list()
     
     if not model_list:
         print("No models available or failed to get model list.")
         exit(1)
-    
-    # get the user's choice, via the index
-    is_completed = False
-    while not is_completed:
+
+    chosen_model = None
+    while chosen_model is None:
         chosen_model_index = input("Enter the index/number of the model you want to use: ")
         if chosen_model_index.isdigit() and 0 <= int(chosen_model_index) < len(model_list):
-            chosen_model = model_list[int(chosen_model_index)].id  # Get the model ID
-
-            user_prompt = input("Enter your prompt: ")
-            messages = [{"role": "user", "content": user_prompt}]
-            response = llm_client.chat_completions(chosen_model, messages)
-            
-            if response:
-                for chunk in response:
-                    if chunk.choices[0].delta.content:
-                        print(chunk.choices[0].delta.content, end="", flush=True)
-            else:
-                print("Failed to get response from the model.")
-
-            is_completed = True
+            chosen_model = model_list[int(chosen_model_index)].id
         else:
             print("Invalid input. Please enter a valid index.")
+
+    user_prompt = input("Enter your prompt: ")
     
+    messages = [{"role": "user", "content": user_prompt}]
+    
+    print("Non-streaming response:")
+    async for chunk in llm_client.chat_completions(chosen_model, messages, False):
+        print(chunk)
+
+    print("\nStreaming response:")
+    async for chunk in llm_client.chat_completions(chosen_model, messages, True):
+        print(chunk, end="", flush=True)
+    print()
+
+
+if __name__ == "__main__":
+    asyncio.run(test())
