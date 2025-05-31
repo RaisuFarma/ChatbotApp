@@ -1,10 +1,13 @@
 import os
 import logging
+import time
 import asyncio
 from dotenv import load_dotenv
 
 from openai import AsyncOpenAI
-from typing import Optional
+from typing import Optional, AsyncGenerator
+
+from llm_config import ProviderConfig
 
 load_dotenv()
 
@@ -13,48 +16,46 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
-class ProviderConfig:
-    def __init__(
-            self, description: str,
-            api_key: Optional[str] = None,
-            base_url: Optional[str] = None,
-    ):
-        self.description = description
-        self.api_key = api_key
-        self.base_url = base_url
-
-
-class LLMClient:
+class LLMClient():
     def __init__(
             self,
-            config: ProviderConfig,       
-    ):
+            config: ProviderConfig,
+    ) -> None:
         self.config = config
-        self.client: Optional[AsyncOpenAI] = None
-        self.model_list = []
-        self.init_client()
+        self._model_cache_time = None
+        self._model_cache_list = None
+        self.client = AsyncOpenAI(
+            api_key=config.api_key,
+            base_url=config.base_url,
+        )
 
-    def init_client(self):
-        try:
-            self.client = AsyncOpenAI(
-                api_key=self.config.api_key,
-                base_url=self.config.base_url,
-            )
-        except Exception as e:
-            logger.error(f"Error initializing OpenAI client: {e}")
-            self.client = None
+    async def close(self) -> None:
+        await self.client.aclose()
 
-    async def get_model_list(self):
+    def _is_within_cache_ttl(self) -> bool:
+        if self._model_cache_time is None or self._model_cache_time <= 0:
+            return False
+
+        return (time.time() - self._model_cache_time) < self._model_cache_ttl
+    
+    async def list_models(
+            self,
+            refresh: bool = False
+    ) -> list:
         if not self.client:
             logger.error("Client not initialized")
             return []
+        
+        if not refresh and self._is_within_cache_ttl():
+            return self._model_cache_list
         
         try:
             model_list = await self.client.models.list()
             models = list(model_list.data)
             for id, model in enumerate(models):
                 print(f"{id} - {model.id}")
-            self.model_list = models
+            self._model_cache_list = models
+            self._model_cache_time = time.time()
             return models
         except Exception as e:
             logger.error(f"Error getting model list: {e}")
@@ -62,25 +63,26 @@ class LLMClient:
         
     async def chat_completions(
             self,
-            model_name: str,
-            input_list,
+            model: str,
+            messages: list,
             stream: bool = True
-    ):
+    ) -> AsyncGenerator[str, None]:
         if not self.client:
             logger.error("Client not initialized")
             return
         
         try: 
             response = await self.client.chat.completions.create(
-                model=model_name,
-                messages=input_list,
+                model=model,
+                messages=messages,
                 stream=stream,
             )
 
             if stream:
                 async for chunk in response:
-                    if chunk.choices[0].delta.content:
-                        yield chunk.choices[0].delta.content
+                    content = chunk.choices[0].delta.content
+                    if content:
+                        yield content
             else:
                 yield response.choices[0].message.content
         except Exception as e:
@@ -89,6 +91,7 @@ class LLMClient:
 
 async def test():
     config = ProviderConfig(
+        name="Test",
         description="Test",
         api_key=os.getenv("API_KEY"),
         base_url=os.getenv("BASE_URL"),
@@ -96,7 +99,7 @@ async def test():
 
     llm_client = LLMClient(config)
 
-    model_list = await llm_client.get_model_list()
+    model_list = await llm_client.list_models()
     
     if not model_list:
         print("No models available or failed to get model list.")
